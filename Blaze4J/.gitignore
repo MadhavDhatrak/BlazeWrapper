@@ -1,0 +1,39 @@
+# Build directories
+build/
+target/
+build-linux/
+build-macos/
+
+# Dependencies
+deps/
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+
+# Compiled files
+*.class
+*.dll
+*.so
+*.dylib
+
+# Maven
+.mvn/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+.gitmodules
+
+
+.vs
+*.log
+# Ignore test resources
+src/test/resources/

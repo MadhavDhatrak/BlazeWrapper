@@ -1,0 +1,254 @@
+#include <sourcemeta/blaze/compiler.h>
+#include <sourcemeta/blaze/evaluator.h>
+#include <sourcemeta/core/json.h>
+#include <sourcemeta/core/jsonschema.h>
+#include <sourcemeta/core/jsonpointer.h>
+#include <string>
+#include <cstring>
+#include <sstream>
+#include <iostream>
+#include <cstdint>
+#include <cstdlib>
+#include <optional>
+#include <mutex>
+#include <unordered_map>
+#include <memory>
+
+// Portable export macro
+#if defined(_WIN32) || defined(_WIN64)
+  #define BLAZE_EXPORT __declspec(dllexport)
+#else
+  // Define visibility default without direct attribute syntax
+  #define BLAZE_VISIBILITY __attribute__((visibility("default")))
+  #define BLAZE_EXPORT BLAZE_VISIBILITY
+#endif
+
+// Resolver pointer
+thread_local const char* (*current_custom_resolver)(const char*) = nullptr;
+
+extern "C" {
+
+BLAZE_EXPORT char* blaze_alloc_string(size_t size) {
+    return static_cast<char*>(malloc(size));
+}
+
+BLAZE_EXPORT void blaze_free_string(char* ptr) {
+    free(ptr);
+}
+
+BLAZE_EXPORT int64_t blaze_compile(const char* schema, const char* walker, const char* (*custom_resolver)(const char*), const char* default_dialect) {
+    try {
+        if (schema == nullptr) {
+            std::cerr << "Error: Schema is null" << std::endl;
+            throw std::runtime_error("Schema is null");
+        }
+
+        std::string schema_str(schema);
+        
+        // Process default dialect
+        std::optional<std::string> dialect_opt = std::nullopt;
+        if (default_dialect != nullptr && strlen(default_dialect) > 0) {
+            dialect_opt = std::string(default_dialect);
+        }
+
+        try {
+            auto json_schema = sourcemeta::core::parse_json(schema_str);
+
+            auto walker_obj = sourcemeta::core::schema_official_walker;
+            current_custom_resolver = custom_resolver;
+
+            auto resolver_obj = [](std::string_view uri_sv) -> std::optional<sourcemeta::core::JSON> {
+                std::string uri(uri_sv);
+
+                auto official_result = sourcemeta::core::schema_official_resolver(uri_sv);
+                if (official_result.has_value()) {
+                    return official_result;
+                }
+
+                if (current_custom_resolver != nullptr) {
+                    const char* result_c_str = current_custom_resolver(uri.c_str());
+
+                    if (result_c_str != nullptr) {
+                        std::string result_str(result_c_str);
+                        try {
+                            auto parsed_json = sourcemeta::core::parse_json(result_str);
+                            return parsed_json;
+                        } catch (const std::exception& e) {
+                            std::cerr << "Error parsing JSON from custom resolver: " << e.what() << std::endl;
+                        }
+                    }
+                }
+
+                return std::nullopt;
+            };
+
+            auto compiler = sourcemeta::blaze::default_schema_compiler;
+
+            auto compiled = sourcemeta::blaze::compile(
+                json_schema,
+                walker_obj,
+                resolver_obj,
+                compiler,
+                sourcemeta::blaze::Mode::FastValidation,
+                dialect_opt
+            );
+
+            current_custom_resolver = nullptr;
+
+            auto* template_ptr = new sourcemeta::blaze::Template(compiled);
+            return reinterpret_cast<int64_t>(template_ptr);
+        } catch (const std::exception& internal_e) {
+            current_custom_resolver = nullptr;
+            std::cerr << "Internal error during compilation: " << internal_e.what() << std::endl;
+            throw;
+        }
+    } catch (const std::exception& e) {
+        current_custom_resolver = nullptr;
+        std::cerr << "Compilation error: " << e.what() << std::endl;
+        return 0;
+    } catch (...) {
+        current_custom_resolver = nullptr;
+        std::cerr << "Unknown error during compilation" << std::endl;
+        return 0;
+    }
+}
+
+BLAZE_EXPORT bool blaze_validate(int64_t schemaHandle, const char* instance) {
+    try {
+        if (instance == nullptr) {
+            std::cerr << "Error: Instance is null" << std::endl;
+            return false;
+        }
+
+        if (schemaHandle == 0) {
+            std::cerr << "Error: Invalid schema handle" << std::endl;
+            return false;
+        }
+
+        std::string instance_str(instance);
+        auto json_instance = sourcemeta::core::parse_json(instance_str);
+
+        sourcemeta::blaze::Evaluator evaluator;
+        auto* schema_template = reinterpret_cast<sourcemeta::blaze::Template*>(schemaHandle);
+
+        if (!schema_template) {
+            std::cerr << "Error: Schema template is null" << std::endl;
+            return false;
+        }
+
+        return evaluator.validate(*schema_template, json_instance);
+    } catch (const std::exception& e) {
+        std::cerr << "Validation error: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "Unknown error during validation" << std::endl;
+        return false;
+    }
+}
+
+BLAZE_EXPORT void blaze_free_template(int64_t schemaHandle) {
+    if (schemaHandle != 0) {
+        auto* template_ptr = reinterpret_cast<sourcemeta::blaze::Template*>(schemaHandle);
+        delete template_ptr;
+    }
+}
+
+BLAZE_EXPORT void blaze_free_result(const char* result) {
+    if (result) {
+        delete[] result;
+    }
+}
+
+BLAZE_EXPORT char* blaze_validate_with_output(int64_t schemaHandle, const char* instance) {
+    try {
+        if (instance == nullptr) return nullptr;
+        if (schemaHandle == 0) return nullptr;
+
+        std::string instance_str(instance);
+        auto json_instance = sourcemeta::core::parse_json(instance_str);
+        auto* schema_template = reinterpret_cast<sourcemeta::blaze::Template*>(schemaHandle);
+        
+        // Collect errors using callback
+        struct ErrorInfo {
+            std::string message;
+            std::string instance_location;
+            std::string evaluate_path;
+        };
+        std::vector<ErrorInfo> errors;
+        
+        auto callback = [&errors](
+            const sourcemeta::blaze::EvaluationType type,
+            bool result,
+            const sourcemeta::blaze::Instruction &instruction,
+            const sourcemeta::core::WeakPointer &evaluate_path,
+            const sourcemeta::core::WeakPointer &instance_location,
+            const sourcemeta::core::JSON &annotation) -> void {
+            if (!result) {
+                ErrorInfo error;
+                
+                // Extract instance location
+                std::ostringstream instance_ss;
+                sourcemeta::core::stringify(instance_location, instance_ss);
+                error.instance_location = instance_ss.str();
+                
+                // Extract schema path
+                std::ostringstream path_ss;
+                sourcemeta::core::stringify(evaluate_path, path_ss);
+                error.evaluate_path = path_ss.str();
+                
+                // Create error message from instruction
+                error.message = "Validation failed at " + error.instance_location + 
+                               " (schema path: " + error.evaluate_path + ")";
+                
+                errors.push_back(error);
+            }
+        };
+        
+        sourcemeta::blaze::Evaluator evaluator;
+        bool valid = evaluator.validate(*schema_template, json_instance, callback);
+        
+        // Build JSON result
+        std::ostringstream json_ss;
+        json_ss << "{\"valid\":" << (valid ? "true" : "false");
+        if (!valid && !errors.empty()) {
+            json_ss << ",\"errors\":[";
+            bool first_error = true;
+            for (const auto& error : errors) {
+                if (!first_error) {
+                    json_ss << ",";
+                }
+                first_error = false;
+                // Basic escaping for quotes and backslashes
+                auto escape = [](const std::string& s) {
+                    std::string out;
+                    for (char c : s) {
+                        if (c == '"' || c == '\\') out.push_back('\\');
+                        out.push_back(c);
+                    }
+                    return out;
+                };
+                json_ss << "{\"message\":\"" << escape(error.message) 
+                       << "\",\"instance_location\":\"" << escape(error.instance_location)
+                       << "\",\"evaluate_path\":\"" << escape(error.evaluate_path) << "\"}";
+            }
+            json_ss << "]";
+        }
+        json_ss << "}";
+        std::string result_str = json_ss.str();
+        char* buffer = new char[result_str.size() + 1];
+        std::strcpy(buffer, result_str.c_str());
+        return buffer;
+    } catch (const std::exception& e) {
+        std::cerr << "Detailed validation error: " << e.what() << std::endl;
+        return nullptr;
+    } catch (...) {
+        std::cerr << "Unknown error during detailed validation" << std::endl;
+        return nullptr;
+    }
+}
+
+BLAZE_EXPORT void blaze_free_json(char* json) {
+    if (json) delete[] json;
+}
+
+} 
